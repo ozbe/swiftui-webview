@@ -9,8 +9,8 @@ public enum WebViewAction: Equatable {
          reload,
          goBack,
          goForward,
-         evaluateJS(String, (Result<Any?, Error>) -> Void)
-    
+         evaluateJS(String, (Result<Any?, Error>) -> Void),
+         scrollTo(CGPoint, Bool)
     
     public static func == (lhs: WebViewAction, rhs: WebViewAction) -> Bool {
         if case .idle = lhs,
@@ -41,6 +41,10 @@ public enum WebViewAction: Equatable {
            case let .evaluateJS(commandRHS, _) = rhs {
             return commandLHS == commandRHS
         }
+        if case let .scrollTo(contentOffsetLHS, animatedLHS) = lhs,
+           case let .scrollTo(contentOffsetRHS, animatedRHS) = rhs {
+            return contentOffsetLHS == contentOffsetRHS && animatedLHS == animatedRHS
+        }
         return false
     }
 }
@@ -53,6 +57,8 @@ public struct WebViewState: Equatable {
     public internal(set) var error: Error?
     public internal(set) var canGoBack: Bool
     public internal(set) var canGoForward: Bool
+    public internal(set) var contentOffset: CGPoint
+    public internal(set) var contentSize: CGSize
     
     public static let empty = WebViewState(isLoading: false,
                                            pageURL: nil,
@@ -60,7 +66,9 @@ public struct WebViewState: Equatable {
                                            pageHTML: nil,
                                            error: nil,
                                            canGoBack: false,
-                                           canGoForward: false)
+                                           canGoForward: false,
+                                           contentOffset: CGPointZero,
+                                           contentSize: CGSizeZero)
     
     public static func == (lhs: WebViewState, rhs: WebViewState) -> Bool {
         lhs.isLoading == rhs.isLoading
@@ -70,6 +78,8 @@ public struct WebViewState: Equatable {
             && lhs.error?.localizedDescription == rhs.error?.localizedDescription
             && lhs.canGoBack == rhs.canGoBack
             && lhs.canGoForward == rhs.canGoForward
+            && lhs.contentOffset == rhs.contentOffset
+            && lhs.contentSize == rhs.contentSize
     }
 }
 
@@ -84,8 +94,10 @@ public class WebViewCoordinator: NSObject {
     func setLoading(_ isLoading: Bool,
                     canGoBack: Bool? = nil,
                     canGoForward: Bool? = nil,
-                    error: Error? = nil) {
-        var newState =  webView.state
+                    error: Error? = nil,
+                    contentOffset: CGPoint? = nil,
+                    contentSize: CGSize? = nil) {
+        var newState = webView.state
         newState.isLoading = isLoading
         if let canGoBack = canGoBack {
             newState.canGoBack = canGoBack
@@ -96,17 +108,35 @@ public class WebViewCoordinator: NSObject {
         if let error = error {
             newState.error = error
         }
+        if let contentOffset = contentOffset {
+            newState.contentOffset = contentOffset
+        }
+        if let contentSize = contentSize {
+            newState.contentSize = contentSize
+        }
         webView.state = newState
         webView.action = .idle
         actionInProgress = false
     }
 }
 
+#if os(iOS)
+extension WebViewCoordinator: UIScrollViewDelegate {
+    public func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        setLoading(false,
+                   contentOffset: scrollView.contentOffset,
+                   contentSize: scrollView.contentSize)
+    }
+}
+#endif
+
 extension WebViewCoordinator: WKNavigationDelegate {
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
       setLoading(false,
                  canGoBack: webView.canGoBack,
-                 canGoForward: webView.canGoForward)
+                 canGoForward: webView.canGoForward,
+                 contentOffset: webView.scrollView.contentOffset,
+                 contentSize: webView.scrollView.contentSize)
         
         webView.evaluateJavaScript("document.title") { (response, error) in
             if let title = response as? String {
@@ -150,7 +180,9 @@ extension WebViewCoordinator: WKNavigationDelegate {
     public func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
       setLoading(true,
                  canGoBack: webView.canGoBack,
-                 canGoForward: webView.canGoForward)
+                 canGoForward: webView.canGoForward,
+                 contentOffset: webView.scrollView.contentOffset,
+                 contentSize: webView.scrollView.contentSize)
     }
     
     public func webView(_ webView: WKWebView,
@@ -175,15 +207,22 @@ extension WebViewCoordinator: WKNavigationDelegate {
 }
 
 extension WebViewCoordinator: WKUIDelegate {
-  public func webView(_ webView: WKWebView,
+    public func webView(_ webView: WKWebView,
                       createWebViewWith configuration: WKWebViewConfiguration,
                       for navigationAction: WKNavigationAction,
                       windowFeatures: WKWindowFeatures) -> WKWebView? {
-    if navigationAction.targetFrame == nil {
-      webView.load(navigationAction.request)
+        if navigationAction.targetFrame == nil {
+          webView.load(navigationAction.request)
+        }
+        return nil
     }
-    return nil
-  }
+    
+#if os(iOS)
+    public func webView(_ webView: WKWebView, contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo, completionHandler: @escaping (UIContextMenuConfiguration?) -> Void) {
+        let configuration = self.webView.config.contextMenuConfiguration(elementInfo) as? UIContextMenuConfiguration
+        completionHandler(configuration)
+    }
+#endif
 }
 
 public struct WebViewConfig {
@@ -197,13 +236,19 @@ public struct WebViewConfig {
     public let isOpaque: Bool
     public let backgroundColor: Color
     
+#if os(iOS)
+    public let contextMenuConfiguration: (WKContextMenuElementInfo) -> Any?
+#endif
+
     public init(javaScriptEnabled: Bool = true,
                 allowsBackForwardNavigationGestures: Bool = true,
                 allowsInlineMediaPlayback: Bool = true,
                 mediaTypesRequiringUserActionForPlayback: WKAudiovisualMediaTypes = [],
                 isScrollEnabled: Bool = true,
                 isOpaque: Bool = true,
-                backgroundColor: Color = .clear) {
+                backgroundColor: Color = .clear,
+                contextMenuConfiguration: @escaping (WKContextMenuElementInfo) -> Any? = { _ in nil }
+    ) {
         self.javaScriptEnabled = javaScriptEnabled
         self.allowsBackForwardNavigationGestures = allowsBackForwardNavigationGestures
         self.allowsInlineMediaPlayback = allowsInlineMediaPlayback
@@ -211,6 +256,7 @@ public struct WebViewConfig {
         self.isScrollEnabled = isScrollEnabled
         self.isOpaque = isOpaque
         self.backgroundColor = backgroundColor
+        self.contextMenuConfiguration = contextMenuConfiguration
     }
 }
 
@@ -243,7 +289,9 @@ public struct WebView: UIViewRepresentable {
     
     public func makeUIView(context: Context) -> WKWebView {
         let preferences = WKPreferences()
-        preferences.javaScriptEnabled = config.javaScriptEnabled
+        if #unavailable(iOS 14.0) {
+            preferences.javaScriptEnabled = config.javaScriptEnabled
+        }
         
         let configuration = WKWebViewConfiguration()
         configuration.allowsInlineMediaPlayback = config.allowsInlineMediaPlayback
@@ -253,6 +301,7 @@ public struct WebView: UIViewRepresentable {
         let webView = WKWebView(frame: CGRect.zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
+        webView.scrollView.delegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = config.allowsBackForwardNavigationGestures
         webView.scrollView.isScrollEnabled = config.isScrollEnabled
         webView.isOpaque = config.isOpaque
@@ -270,6 +319,7 @@ public struct WebView: UIViewRepresentable {
             return
         }
         context.coordinator.actionInProgress = true
+        
         switch action {
         case .idle:
             break
@@ -291,6 +341,9 @@ public struct WebView: UIViewRepresentable {
                     callback(.success(result))
                 }
             }
+            context.coordinator.actionInProgress = false
+        case .scrollTo(let contentOffset, let animated):
+            uiView.scrollView.setContentOffset(contentOffset, animated: animated)
         }
     }
 }
